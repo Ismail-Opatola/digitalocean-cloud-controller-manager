@@ -46,24 +46,25 @@ const (
 	firewallWorkerCCMNameFormat = "k8s-%s-ccm"
 )
 
-// CachedFirewall stores the current state of the CCM worker firewall.
-type CachedFirewall struct {
+// cachedFirewall stores the current state of the CCM worker firewall.
+type cachedFirewall struct {
 	// The cached state of the firewall.
 	state *godo.Firewall
 }
 
-// FirewallCache stores a cached firewall and mutex to handle concurrent access.
-type FirewallCache struct {
+// firewallCache stores a cached firewall and mutex to handle concurrent access.
+type firewallCache struct {
 	mu       sync.RWMutex // protects firewallMap.
-	firewall *CachedFirewall
+	firewall *cachedFirewall
 }
 
-// FirewallManagerOp handles communication with methods of the FirewallManager.
-type FirewallManagerOp struct {
+// firewallManagerOp handles communication with methods of the FirewallManager.
+type firewallManagerOp struct {
 	client  *godo.Client
-	fwCache *FirewallCache
+	fwCache *firewallCache
 }
 
+// FirewallManager manages the interaction with the DO Firewalls API.
 type FirewallManager interface {
 	// Get returns the current CCM worker firewall representation (i.e., the DO Firewall object).
 	Get(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) (godo.Firewall, error)
@@ -79,7 +80,7 @@ type FirewallController struct {
 	workerFirewallName string
 	tags               []string
 	serviceLister      corelisters.ServiceLister
-	firewallManagerOp  FirewallManagerOp
+	firewallManagerOp  firewallManagerOp
 }
 
 // NewFirewallController returns a new firewall controller to reconcile CCM worker firewall state.
@@ -88,7 +89,7 @@ func NewFirewallController(
 	kubeClient clientset.Interface,
 	serviceInformer coreinformers.ServiceInformer,
 	tags []string,
-	fwManagerOp FirewallManagerOp,
+	fwManagerOp firewallManagerOp,
 	ctx context.Context,
 ) (*FirewallController, error) {
 	if kubeClient != nil && kubeClient.CoreV1().RESTClient().GetRateLimiter() != nil {
@@ -101,7 +102,6 @@ func NewFirewallController(
 		kubeClient:         kubeClient,
 		client:             &godo.Client{},
 		workerFirewallName: workerFwName,
-		tags:               tags,
 		firewallManagerOp:  fwManagerOp,
 	}
 
@@ -124,15 +124,19 @@ func NewFirewallController(
 	return fc, nil
 }
 
-func (fc *FirewallController) Run(ctx context.Context, inboundRules []godo.InboundRule, fm *FirewallManagerOp, stopCh <-chan struct{}) {
+func (fc *FirewallController) Run(ctx context.Context, inboundRules []godo.InboundRule, fm *firewallManagerOp, stopCh <-chan struct{}) {
 	wait.Until(func() {
-		firewall, err := fm.Get(ctx, inboundRules, fc)
+		targetFirewallState, err := fm.Get(ctx, inboundRules, fc)
 		if err != nil {
 			klog.Errorf("failed to get worker firewall: %s", err)
 			return
 		}
-		firewallCachedState := *fm.fwCache.firewall.state
-		if cmp.Equal(&firewallCachedState, firewall) {
+		cache := fm.fwCache
+		if cache == nil {
+			fm.updateCache(targetFirewallState)
+		}
+		currentFirewallState := fm.fwCache.firewall.state
+		if cmp.Equal(*currentFirewallState, *targetFirewallState) {
 			return
 		}
 		err = fc.onServiceChange(ctx)
@@ -143,7 +147,7 @@ func (fc *FirewallController) Run(ctx context.Context, inboundRules []godo.Inbou
 }
 
 // Get returns the current CCM worker firewall representation.
-func (fm *FirewallManagerOp) Get(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
+func (fm *firewallManagerOp) Get(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
 	// return the firewall stored in the cache.
 	if fm.firewallCacheExists() {
 		fwsvc := fm.client.Firewalls
@@ -173,7 +177,7 @@ func (fm *FirewallManagerOp) Get(ctx context.Context, inboundRules []godo.Inboun
 }
 
 // Set applies the given inbound rules to the CCM worker firewall when the current rules and target rules differ.
-func (fm *FirewallManagerOp) Set(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) error {
+func (fm *firewallManagerOp) Set(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) error {
 	// retrieve the target firewall representation (CCM worker firewall from cache) and the
 	// current firewall representation from the DO firewalls API. If there are any differences,
 	// handle it.
@@ -189,7 +193,7 @@ func (fm *FirewallManagerOp) Set(ctx context.Context, inboundRules []godo.Inboun
 	return nil
 }
 
-func (fm *FirewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo.Firewall, inboundRules []godo.InboundRule, fc *FirewallController) error {
+func (fm *firewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo.Firewall, inboundRules []godo.InboundRule, fc *FirewallController) error {
 	fm.fwCache.mu.RLock()
 	defer fm.fwCache.mu.RUnlock()
 
@@ -242,14 +246,15 @@ func (fc *FirewallController) onServiceChange(ctx context.Context) error {
 	return fc.firewallManagerOp.Set(ctx, nodePortInboundRules, fc)
 }
 
-func (fm *FirewallManagerOp) updateCache(firewall *godo.Firewall) {
+func (fm *firewallManagerOp) updateCache(firewall *godo.Firewall) {
 	fm.fwCache.mu.Lock()
 	defer fm.fwCache.mu.Unlock()
-	fw := &CachedFirewall{state: firewall}
-	fm.fwCache.firewall.state = fw.state
+	if firewall != nil {
+		fm.fwCache.firewall.state = firewall
+	}
 }
 
-func (fm *FirewallManagerOp) firewallCacheExists() bool {
+func (fm *firewallManagerOp) firewallCacheExists() bool {
 	fm.fwCache.mu.RLock()
 	defer fm.fwCache.mu.RUnlock()
 	if fm.fwCache.firewall != nil {
@@ -258,7 +263,7 @@ func (fm *FirewallManagerOp) firewallCacheExists() bool {
 	return false
 }
 
-func (fm *FirewallManagerOp) updateFirewallRules(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) error {
+func (fm *firewallManagerOp) updateFirewallRules(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) error {
 	rr := godo.FirewallRulesRequest{
 		InboundRules: inboundRules,
 	}
@@ -276,7 +281,7 @@ func (fm *FirewallManagerOp) updateFirewallRules(ctx context.Context, inboundRul
 
 // check each field of the cached firewall and the DO API firewall and update any discrepancies until it
 // matches the target state (cached firewall).
-func (fm *FirewallManagerOp) reconcileFirewall(ctx context.Context, targetState godo.Firewall, currentState godo.Firewall, fc *FirewallController) error {
+func (fm *firewallManagerOp) reconcileFirewall(ctx context.Context, targetState godo.Firewall, currentState godo.Firewall, fc *FirewallController) error {
 	updateStateRequest := &godo.FirewallRequest{}
 	if targetState.Name != currentState.Name {
 		updateStateRequest.Name = targetState.Name
@@ -305,7 +310,7 @@ func (fm *FirewallManagerOp) reconcileFirewall(ctx context.Context, targetState 
 	return nil
 }
 
-func (fm *FirewallManagerOp) createFirewallAndUpdateCache(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
+func (fm *firewallManagerOp) createFirewallAndUpdateCache(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
 	// make create request since firewall does not exist, then cache firewall state.
 	fr := &godo.FirewallRequest{
 		Name:         fc.workerFirewallName,
