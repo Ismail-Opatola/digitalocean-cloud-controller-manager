@@ -45,16 +45,46 @@ type stubFirewallManagerOp struct {
 	fwCache *stubFirewallCache
 }
 
+// Get returns the current CCM worker firewall representation.
+func (fm *stubFirewallManagerOp) Get(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) (godo.Firewall, error) {
+	// return the firewall stored in the cache.
+	if fm.firewallCacheExists() {
+		fwsvc := fm.client.Firewalls
+		fw, _, err := fwsvc.Get(ctx, fm.fwCache.firewall.state.ID)
+		if err != nil {
+			return godo.Firewall{}, fmt.Errorf("failed to get firewall: %s", err)
+		}
+		return *fw, nil
+	}
+	// cached firewall does not exist, so iterate through firewall API provided list and return
+	// the firewall with the matching firewall name.
+	firewallList, err := allFirewallList(ctx, fm.client)
+	if err != nil {
+		return godo.Firewall{}, fmt.Errorf("failed to list firewalls: %s", err)
+	}
+	for _, fw := range firewallList {
+		if fw.Name == c.workerFirewallName {
+			return fw, nil
+		}
+	}
+	// firewall is not found via firewalls API, so we need to create it.
+	fw, err := fm.createFirewallAndUpdateCache(ctx, inboundRules, c)
+	if err != nil {
+		return godo.Firewall{}, fmt.Errorf("failed to create firewall: %s", err)
+	}
+	return *fw, nil
+}
+
 // Set applies the given inbound rules to the CCM worker firewall when the current rules and target rules differ.
-func (fm *stubFirewallManagerOp) Set(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) error {
+func (fm *stubFirewallManagerOp) Set(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) error {
 	// retrieve the target firewall representation (CCM worker firewall from cache) and the
 	// current firewall representation from the DO firewalls API. If there are any differences,
 	// handle it.
-	fw, err := fm.Get(ctx, inboundRules, fc)
+	fw, err := fm.Get(ctx, inboundRules, c)
 	if err != nil {
 		return fmt.Errorf("failed to get firewall state: %s", err)
 	}
-	err = fm.checkFirewallEquality(ctx, fw, inboundRules, fc)
+	err = fm.checkFirewallEquality(ctx, &fw, inboundRules, c)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile current firewall state with target firewall state: %v", err)
 	}
@@ -64,36 +94,6 @@ func (fm *stubFirewallManagerOp) Set(ctx context.Context, inboundRules []godo.In
 
 func (fm *stubFirewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo.Firewall, inboundRules []godo.InboundRule, fc *FirewallController) error {
 	return nil
-}
-
-// Get returns the current CCM worker firewall representation.
-func (fm *stubFirewallManagerOp) Get(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
-	// return the firewall stored in the cache.
-	if fm.firewallCacheExists() {
-		fwsvc := fm.client.Firewalls
-		fw, _, err := fwsvc.Get(ctx, fm.fwCache.firewall.state.ID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get firewall: %s", err)
-		}
-		return fw, nil
-	}
-	// cached firewall does not exist, so iterate through firewall API provided list and return
-	// the firewall with the matching firewall name.
-	firewallList, err := allFirewallList(ctx, fm.client)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list firewalls: %s", err)
-	}
-	for _, fw := range firewallList {
-		if fw.Name == fc.workerFirewallName {
-			return &fw, nil
-		}
-	}
-	// firewall is not found via firewalls API, so we need to create it.
-	fw, err := fm.createFirewallAndUpdateCache(ctx, inboundRules, fc)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create firewall: %s", err)
-	}
-	return fw, nil
 }
 
 func (fm *stubFirewallManagerOp) createFirewallAndUpdateCache(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
@@ -139,18 +139,24 @@ func TestFirewallController_Run(t *testing.T) {
 		w.Write([]byte(`{"account":null}`))
 	}))
 	gclient, _ := godo.New(http.DefaultClient, godo.SetBaseURL(ts.URL))
-	fwManagerOp := stubFirewallManagerOp{
+	var fwManager FirewallManager
+	fwManager = &stubFirewallManagerOp{
 		client:  gclient,
 		fwCache: &stubFirewallCache{},
 	}
 	rule := &godo.InboundRule{}
 	inboundRules := []godo.InboundRule{*rule}
-	fc, err := NewFirewallController(fakeWorkerFirewallName, kclient, inf.Core().V1().Services(), []string{}, &fwManagerOp, ctx)
+	fc, err := NewFirewallController(fakeWorkerFirewallName, kclient, gclient, inf.Core().V1().Services(), []string{}, &fwManager, ctx)
 	stop := make(chan struct{})
 
 	// t.Logf to log output to the terminal
 	// run actual tests
-	fc.Run(ctx, inboundRules, &fwManagerOp, stop)
+	var fwManagerOp *firewallManagerOp
+	fwManagerOp = &firewallManagerOp{
+		client:  gclient,
+		fwCache: &firewallCache{},
+	}
+	go fc.Run(ctx, inboundRules, &godo.Firewall{}, fwManagerOp, stop)
 	select {
 	case <-stop:
 		// No-op: test succeeded

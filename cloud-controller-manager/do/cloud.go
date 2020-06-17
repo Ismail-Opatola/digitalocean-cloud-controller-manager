@@ -143,7 +143,7 @@ func init() {
 
 func (c *cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
 	clientset := clientBuilder.ClientOrDie("do-shared-informers")
-	ctx := context.TODO()
+	// ctx := context.TODO()
 	sharedInformer := informers.NewSharedInformerFactory(clientset, 0)
 
 	res := NewResourcesController(c.resources, sharedInformer.Core().V1().Services(), clientset)

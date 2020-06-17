@@ -80,16 +80,18 @@ type FirewallController struct {
 	workerFirewallName string
 	tags               []string
 	serviceLister      corelisters.ServiceLister
-	firewallManagerOp  firewallManagerOp
+	firewallManager    *FirewallManager
+	// firewallManagerOp  *firewallManagerOp
 }
 
 // NewFirewallController returns a new firewall controller to reconcile CCM worker firewall state.
 func NewFirewallController(
 	workerFwName string,
 	kubeClient clientset.Interface,
+	client *godo.Client,
 	serviceInformer coreinformers.ServiceInformer,
 	tags []string,
-	fwManagerOp firewallManagerOp,
+	fwManager *FirewallManager,
 	ctx context.Context,
 ) (*FirewallController, error) {
 	if kubeClient != nil && kubeClient.CoreV1().RESTClient().GetRateLimiter() != nil {
@@ -100,21 +102,26 @@ func NewFirewallController(
 
 	fc := &FirewallController{
 		kubeClient:         kubeClient,
-		client:             &godo.Client{},
+		client:             client,
 		workerFirewallName: workerFwName,
-		firewallManagerOp:  fwManagerOp,
+		firewallManager:    fwManager,
+	}
+
+	fwManagerOp := &firewallManagerOp{
+		client:  client,
+		fwCache: &firewallCache{},
 	}
 
 	serviceInformer.Informer().AddEventHandlerWithResyncPeriod(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(cur interface{}) {
-				fc.onServiceChange(ctx)
+				fc.onServiceChange(ctx, fwManagerOp)
 			},
 			UpdateFunc: func(old, cur interface{}) {
-				fc.onServiceChange(ctx)
+				fc.onServiceChange(ctx, fwManagerOp)
 			},
 			DeleteFunc: func(obj interface{}) {
-				fc.onServiceChange(ctx)
+				fc.onServiceChange(ctx, fwManagerOp)
 			},
 		},
 		serviceSyncPeriod,
@@ -124,7 +131,7 @@ func NewFirewallController(
 	return fc, nil
 }
 
-func (fc *FirewallController) Run(ctx context.Context, inboundRules []godo.InboundRule, fm *firewallManagerOp, stopCh <-chan struct{}) {
+func (fc *FirewallController) Run(ctx context.Context, inboundRules []godo.InboundRule, currentFirewallState *godo.Firewall, fm *firewallManagerOp, stopCh <-chan struct{}) {
 	wait.Until(func() {
 		targetFirewallState, err := fm.Get(ctx, inboundRules, fc)
 		if err != nil {
@@ -133,13 +140,14 @@ func (fc *FirewallController) Run(ctx context.Context, inboundRules []godo.Inbou
 		}
 		cache := fm.fwCache
 		if cache == nil {
-			fm.updateCache(targetFirewallState)
+			fc.updateCache(targetFirewallState, &firewallManagerOp{})
 		}
-		currentFirewallState := fm.fwCache.firewall.state
-		if cmp.Equal(*currentFirewallState, *targetFirewallState) {
-			return
+		if currentFirewallState != nil {
+			if cmp.Equal(currentFirewallState, targetFirewallState) {
+				return
+			}
 		}
-		err = fc.onServiceChange(ctx)
+		err = fc.onServiceChange(ctx, fm)
 		if err != nil {
 			klog.Errorf("Failed to reconcile worker firewall: %s", err)
 		}
@@ -204,7 +212,7 @@ func (fm *firewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo
 			return nil
 		}
 	} else if !cmp.Equal(cachedFw.InboundRules, inboundRules) && cmp.Equal(fw.InboundRules, inboundRules) {
-		fm.updateCache(fw)
+		fc.updateCache(fw, fm)
 	} else if !cmp.Equal(fw.InboundRules, inboundRules) {
 		err := fm.updateFirewallRules(ctx, inboundRules, fc)
 		if err != nil {
@@ -220,7 +228,7 @@ func (fm *firewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo
 	return nil
 }
 
-func (fc *FirewallController) onServiceChange(ctx context.Context) error {
+func (fc *FirewallController) onServiceChange(ctx context.Context, fm *firewallManagerOp) error {
 	var nodePortInboundRules []godo.InboundRule
 	serviceList, err := fc.serviceLister.List(labels.Nothing())
 	if err != nil {
@@ -243,10 +251,10 @@ func (fc *FirewallController) onServiceChange(ctx context.Context) error {
 	if len(nodePortInboundRules) == 0 {
 		return nil
 	}
-	return fc.firewallManagerOp.Set(ctx, nodePortInboundRules, fc)
+	return fm.Set(ctx, nodePortInboundRules, fc)
 }
 
-func (fm *firewallManagerOp) updateCache(firewall *godo.Firewall) {
+func (fc *FirewallController) updateCache(firewall *godo.Firewall, fm *firewallManagerOp) {
 	fm.fwCache.mu.Lock()
 	defer fm.fwCache.mu.Unlock()
 	if firewall != nil {
@@ -321,6 +329,6 @@ func (fm *firewallManagerOp) createFirewallAndUpdateCache(ctx context.Context, i
 	if err != nil {
 		return nil, fmt.Errorf("failed to create firewall: %s", err)
 	}
-	fm.updateCache(fw)
+	fc.updateCache(fw, fm)
 	return fw, nil
 }
