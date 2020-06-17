@@ -79,7 +79,7 @@ type FirewallController struct {
 	workerFirewallName string
 	tags               []string
 	serviceLister      corelisters.ServiceLister
-	firewallManager    FirewallManager
+	firewallManagerOp  FirewallManagerOp
 }
 
 // NewFirewallController returns a new firewall controller to reconcile CCM worker firewall state.
@@ -88,7 +88,7 @@ func NewFirewallController(
 	kubeClient clientset.Interface,
 	serviceInformer coreinformers.ServiceInformer,
 	tags []string,
-	fwManager FirewallManager,
+	fwManagerOp FirewallManagerOp,
 	ctx context.Context,
 ) (*FirewallController, error) {
 	if kubeClient != nil && kubeClient.CoreV1().RESTClient().GetRateLimiter() != nil {
@@ -102,7 +102,7 @@ func NewFirewallController(
 		client:             &godo.Client{},
 		workerFirewallName: workerFwName,
 		tags:               tags,
-		firewallManager:    fwManager,
+		firewallManagerOp:  fwManagerOp,
 	}
 
 	serviceInformer.Informer().AddEventHandlerWithResyncPeriod(
@@ -239,7 +239,7 @@ func (fc *FirewallController) onServiceChange(ctx context.Context) error {
 	if len(nodePortInboundRules) == 0 {
 		return nil
 	}
-	return fc.firewallManager.Set(ctx, nodePortInboundRules, fc)
+	return fc.firewallManagerOp.Set(ctx, nodePortInboundRules, fc)
 }
 
 func (fm *FirewallManagerOp) updateCache(firewall *godo.Firewall) {
