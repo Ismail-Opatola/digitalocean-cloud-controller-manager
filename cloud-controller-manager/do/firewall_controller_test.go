@@ -62,38 +62,8 @@ func (fm *stubFirewallManagerOp) Set(ctx context.Context, inboundRules []godo.In
 	return nil
 }
 
-func TestFirewallController_Run(t *testing.T) {
-	// setup arguments
-	ctx := context.TODO()
-	fakeWorkerFirewallName := "myFirewallWorkerName"
-	kclient := fake.NewSimpleClientset()
-	inf := informers.NewSharedInformerFactory(kclient, 0)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"account":null}`))
-	}))
-	gclient, _ := godo.New(http.DefaultClient, godo.SetBaseURL(ts.URL))
-	fwManagerOp := stubFirewallManagerOp{
-		client:  gclient,
-		fwCache: &stubFirewallCache{},
-	}
-	rule := &godo.InboundRule{}
-	inboundRules := []godo.InboundRule{*rule}
-	fc, err := NewFirewallController(fakeWorkerFirewallName, kclient, inf.Core().V1().Services(), []string{}, fwManagerOp, ctx)
-	stop := make(chan struct{})
-
-	// t.Logf to log output to the terminal
-	// run actual tests
-	fc.Run(ctx, inboundRules, &fwManagerOp, stop)
-	select {
-	case <-stop:
-		// No-op: test succeeded
-		assert.NoError(t, err)
-		assert.NotNil(t, fc)
-	case <-time.After(3 * time.Second):
-		// Terminate goroutines just in case.
-		close(stop)
-	}
+func (fm *stubFirewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo.Firewall, inboundRules []godo.InboundRule, fc *FirewallController) error {
+	return nil
 }
 
 // Get returns the current CCM worker firewall representation.
@@ -156,4 +126,38 @@ func (fm *stubFirewallManagerOp) firewallCacheExists() bool {
 		return true
 	}
 	return false
+}
+
+func TestFirewallController_Run(t *testing.T) {
+	// setup arguments
+	ctx := context.TODO()
+	fakeWorkerFirewallName := "myFirewallWorkerName"
+	kclient := fake.NewSimpleClientset()
+	inf := informers.NewSharedInformerFactory(kclient, 0)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"account":null}`))
+	}))
+	gclient, _ := godo.New(http.DefaultClient, godo.SetBaseURL(ts.URL))
+	fwManagerOp := stubFirewallManagerOp{
+		client:  gclient,
+		fwCache: &stubFirewallCache{},
+	}
+	rule := &godo.InboundRule{}
+	inboundRules := []godo.InboundRule{*rule}
+	fc, err := NewFirewallController(fakeWorkerFirewallName, kclient, inf.Core().V1().Services(), []string{}, &fwManagerOp, ctx)
+	stop := make(chan struct{})
+
+	// t.Logf to log output to the terminal
+	// run actual tests
+	fc.Run(ctx, inboundRules, &fwManagerOp, stop)
+	select {
+	case <-stop:
+		// No-op: test succeeded
+		assert.NoError(t, err)
+		assert.NotNil(t, fc)
+	case <-time.After(3 * time.Second):
+		// Terminate goroutines just in case.
+		close(stop)
+	}
 }
