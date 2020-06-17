@@ -32,7 +32,6 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
 	"k8s.io/component-base/metrics/prometheus/ratelimiter"
 	"k8s.io/klog"
 )
@@ -47,86 +46,108 @@ const (
 	firewallWorkerCCMNameFormat = "k8s-%s-ccm"
 )
 
-type cachedFirewall struct {
+// CachedFirewall stores the current state of the CCM worker firewall.
+type CachedFirewall struct {
 	// The cached state of the firewall.
 	state *godo.Firewall
 }
 
-type firewallCache struct {
+// FirewallCache stores a cached firewall and mutex to handle concurrent access.
+type FirewallCache struct {
 	mu       sync.RWMutex // protects firewallMap.
-	firewall *cachedFirewall
+	firewall *CachedFirewall
 }
 
-// Controller helps to keep cloud provider service firewalls in sync.
-type Controller struct {
+// FirewallManagerOp handles communication with methods of the FirewallManager.
+type FirewallManagerOp struct {
+	client  *godo.Client
+	fwCache *FirewallCache
+}
+
+type FirewallManager interface {
+	// Get returns the current CCM worker firewall representation (i.e., the DO Firewall object).
+	Get(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) (godo.Firewall, error)
+
+	// Set applies the given inbound rules to the CCM worker firewall.
+	Set(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) error
+}
+
+// FirewallController helps to keep cloud provider service firewalls in sync.
+type FirewallController struct {
 	kubeClient         clientset.Interface
 	client             *godo.Client
-	fwCache            *firewallCache
-	queue              workqueue.RateLimitingInterface
-	firewallService    *godo.FirewallsServiceOp
 	workerFirewallName string
 	tags               []string
 	serviceLister      corelisters.ServiceLister
 	firewallManager    FirewallManager
 }
 
-type FirewallManager interface {
-	// Get returns the current CCM worker firewall representation (i.e., the DO Firewall object).
-	Get(ctx context.Context, inboundRules []godo.InboundRule) (godo.Firewall, error)
-
-	// Set applies the given inbound rules to the CCM worker firewall.
-	Set(ctx context.Context, inboundRules []godo.InboundRule) error
-}
-
 // NewFirewallController returns a new firewall controller to reconcile CCM worker firewall state.
 func NewFirewallController(
-	workerFirewallName string,
+	workerFwName string,
 	kubeClient clientset.Interface,
-	client *godo.Client,
-	firewallService *godo.FirewallsService,
 	serviceInformer coreinformers.ServiceInformer,
 	tags []string,
+	fwManager FirewallManager,
 	ctx context.Context,
-) (*Controller, error) {
+) (*FirewallController, error) {
 	if kubeClient != nil && kubeClient.CoreV1().RESTClient().GetRateLimiter() != nil {
 		if err := ratelimiter.RegisterMetricAndTrackRateLimiterUsage("firewall_controller", kubeClient.CoreV1().RESTClient().GetRateLimiter()); err != nil {
 			return nil, err
 		}
 	}
 
-	c := &Controller{
+	fc := &FirewallController{
 		kubeClient:         kubeClient,
-		client:             client,
-		fwCache:            &firewallCache{firewall: *cachedFirewall},
-		queue:              workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "firewall"),
-		workerFirewallName: workerFirewallName,
+		client:             &godo.Client{},
+		workerFirewallName: workerFwName,
 		tags:               tags,
+		firewallManager:    fwManager,
 	}
 
 	serviceInformer.Informer().AddEventHandlerWithResyncPeriod(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(cur interface{}) {
-				c.onServiceChange(ctx)
+				fc.onServiceChange(ctx)
 			},
 			UpdateFunc: func(old, cur interface{}) {
-				c.onServiceChange(ctx)
+				fc.onServiceChange(ctx)
 			},
 			DeleteFunc: func(obj interface{}) {
-				c.onServiceChange(ctx)
+				fc.onServiceChange(ctx)
 			},
 		},
 		serviceSyncPeriod,
 	)
-	c.serviceLister = serviceInformer.Lister()
+	fc.serviceLister = serviceInformer.Lister()
 
-	return c, nil
+	return fc, nil
+}
+
+func (fc *FirewallController) Run(ctx context.Context, inboundRules []godo.InboundRule, fm *FirewallManagerOp, stopCh <-chan struct{}) {
+	wait.Until(func() {
+		firewall, err := fm.Get(ctx, inboundRules, fc)
+		if err != nil {
+			klog.Errorf("failed to get worker firewall: %s", err)
+			return
+		}
+		firewallCachedState := *fm.fwCache.firewall.state
+		if cmp.Equal(&firewallCachedState, firewall) {
+			return
+		}
+		err = fc.onServiceChange(ctx)
+		if err != nil {
+			klog.Errorf("Failed to reconcile worker firewall: %s", err)
+		}
+	}, 5*time.Minute, stopCh)
 }
 
 // Get returns the current CCM worker firewall representation.
-func (c *Controller) Get(ctx context.Context, inboundRules []godo.InboundRule) (*godo.Firewall, error) {
+func (fm *FirewallManagerOp) Get(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
 	// return the firewall stored in the cache.
-	if c.firewallCacheExists() {
-		fw, _, err := c.firewallService.Get(ctx, c.fwCache.firewall.state.ID)
+	if fm.firewallCacheExists() {
+		fwsvc := fm.client.Firewalls
+		fw, _, err := fwsvc.Get(ctx, fm.fwCache.firewall.state.ID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get firewall: %s", err)
 		}
@@ -134,17 +155,17 @@ func (c *Controller) Get(ctx context.Context, inboundRules []godo.InboundRule) (
 	}
 	// cached firewall does not exist, so iterate through firewall API provided list and return
 	// the firewall with the matching firewall name.
-	firewallList, err := allFirewallList(ctx, c.client)
+	firewallList, err := allFirewallList(ctx, fm.client)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list firewalls: %s", err)
 	}
 	for _, fw := range firewallList {
-		if fw.Name == c.workerFirewallName {
+		if fw.Name == fc.workerFirewallName {
 			return &fw, nil
 		}
 	}
 	// firewall is not found via firewalls API, so we need to create it.
-	fw, err := c.createFirewallAndUpdateCache(ctx, inboundRules)
+	fw, err := fm.createFirewallAndUpdateCache(ctx, inboundRules, fc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create firewall: %s", err)
 	}
@@ -152,60 +173,52 @@ func (c *Controller) Get(ctx context.Context, inboundRules []godo.InboundRule) (
 }
 
 // Set applies the given inbound rules to the CCM worker firewall when the current rules and target rules differ.
-func (c *Controller) Set(ctx context.Context, inboundRules []godo.InboundRule) error {
+func (fm *FirewallManagerOp) Set(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) error {
 	// retrieve the target firewall representation (CCM worker firewall from cache) and the
 	// current firewall representation from the DO firewalls API. If there are any differences,
 	// handle it.
-	fw, err := c.firewallManager.Get(ctx, inboundRules)
+	fw, err := fm.Get(ctx, inboundRules, fc)
 	if err != nil {
 		return fmt.Errorf("failed to get firewall state: %s", err)
 	}
-	cachedFw := c.fwCache.firewall.state
-	firewallsAreEqual := cmp.Equal(cachedFw, fw)
+	err = fm.checkFirewallEquality(ctx, fw, inboundRules, fc)
+	if err != nil {
+		return fmt.Errorf("failed to reconcile current firewall state with target firewall state: %v", err)
+	}
+
+	return nil
+}
+
+func (fm *FirewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo.Firewall, inboundRules []godo.InboundRule, fc *FirewallController) error {
+	fm.fwCache.mu.RLock()
+	defer fm.fwCache.mu.RUnlock()
+
+	cachedFw := fm.fwCache.firewall.state
+	isEqual := cmp.Equal(cachedFw, fw)
 	if cmp.Equal(cachedFw.InboundRules, inboundRules) && cmp.Equal(fw.InboundRules, inboundRules) {
-		if firewallsAreEqual {
+		if isEqual {
 			return nil
 		}
 	} else if !cmp.Equal(cachedFw.InboundRules, inboundRules) && cmp.Equal(fw.InboundRules, inboundRules) {
-		c.updateCache(&fw)
+		fm.updateCache(fw)
 	} else if !cmp.Equal(fw.InboundRules, inboundRules) {
-		err := c.updateFirewallRules(ctx, inboundRules)
+		err := fm.updateFirewallRules(ctx, inboundRules, fc)
 		if err != nil {
 			return fmt.Errorf("failed to update firewall state: %s", err)
 		}
 	}
-	if !firewallsAreEqual {
-		err := c.reconcileFirewall(ctx, *cachedFw, fw)
+	if !isEqual {
+		err := fm.reconcileFirewall(ctx, *cachedFw, *fw, fc)
 		if err != nil {
 			return fmt.Errorf("failed to reconcile firewall state: %s", err)
 		}
-		return nil
 	}
 	return nil
 }
 
-func (c *Controller) Run(ctx context.Context, inboundRules []godo.InboundRule, stopCh <-chan struct{}) {
-	wait.Until(func() {
-		firewall, err := c.firewallManager.Get(ctx, inboundRules)
-		if err != nil {
-			klog.Error("failed to get worker firewall: %s", err)
-			return
-		}
-
-		firewallCachedState := c.fwCache.firewall.state
-		if cmp.Equal(firewallCachedState, firewall) {
-			return
-		}
-		err = c.onServiceChange(ctx)
-		if err != nil {
-			klog.Error("Failed to reconcile worker firewall: %s", err)
-		}
-	}, 5*time.Minute, stopCh)
-}
-
-func (c *Controller) onServiceChange(ctx context.Context) error {
+func (fc *FirewallController) onServiceChange(ctx context.Context) error {
 	var nodePortInboundRules []godo.InboundRule
-	serviceList, err := c.serviceLister.List(labels.Nothing())
+	serviceList, err := fc.serviceLister.List(labels.Nothing())
 	if err != nil {
 		return fmt.Errorf("failed to get service state: %s", err)
 	}
@@ -217,7 +230,7 @@ func (c *Controller) onServiceChange(ctx context.Context) error {
 					Protocol:  "tcp",
 					PortRange: strconv.Itoa(int(servicePort.NodePort)),
 					Sources: &godo.Sources{
-						Tags: c.tags,
+						Tags: fc.tags,
 					},
 				})
 			}
@@ -226,57 +239,44 @@ func (c *Controller) onServiceChange(ctx context.Context) error {
 	if len(nodePortInboundRules) == 0 {
 		return nil
 	}
-	return c.firewallManager.Set(ctx, nodePortInboundRules)
+	return fc.firewallManager.Set(ctx, nodePortInboundRules, fc)
 }
 
-func (c *Controller) updateCache(firewall *godo.Firewall) {
-	c.fwCache.mu.Lock()
-	defer c.fwCache.mu.Unlock()
-	fw := &cachedFirewall{state: firewall}
-	c.fwCache.firewall.state = fw.state
+func (fm *FirewallManagerOp) updateCache(firewall *godo.Firewall) {
+	fm.fwCache.mu.Lock()
+	defer fm.fwCache.mu.Unlock()
+	fw := &CachedFirewall{state: firewall}
+	fm.fwCache.firewall.state = fw.state
 }
 
-func (c *Controller) firewallCacheExists() bool {
-	c.fwCache.mu.RLock()
-	defer c.fwCache.mu.RUnlock()
-	if c.fwCache.firewall != nil {
+func (fm *FirewallManagerOp) firewallCacheExists() bool {
+	fm.fwCache.mu.RLock()
+	defer fm.fwCache.mu.RUnlock()
+	if fm.fwCache.firewall != nil {
 		return true
 	}
 	return false
 }
 
-func (c *Controller) updateFirewallRules(ctx context.Context, inboundRules []godo.InboundRule) error {
+func (fm *FirewallManagerOp) updateFirewallRules(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) error {
 	rr := godo.FirewallRulesRequest{
 		InboundRules: inboundRules,
 	}
-	resp, err := c.firewallService.AddRules(ctx, c.fwCache.firewall.state.ID, &rr)
+	fwsvc := fm.client.Firewalls
+	resp, err := fwsvc.AddRules(ctx, fm.fwCache.firewall.state.ID, &rr)
 	if err != nil {
 		return fmt.Errorf("failed to add firewall inbound rules: %s", err)
 	}
 	if resp.StatusCode == 404 {
-		c.createFirewallAndUpdateCache(ctx, inboundRules)
+		fm.createFirewallAndUpdateCache(ctx, inboundRules, fc)
 		return nil
 	}
 	return nil
 }
 
-func (c *Controller) createFirewallAndUpdateCache(ctx context.Context, inboundRules []godo.InboundRule) (*godo.Firewall, error) {
-	// make create request since firewall does not exist, then cache firewall state.
-	fr := &godo.FirewallRequest{
-		Name:         c.workerFirewallName,
-		InboundRules: inboundRules,
-	}
-	fw, _, err := c.firewallService.Create(ctx, fr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create firewall: %s", err)
-	}
-	c.updateCache(fw)
-	return fw, nil
-}
-
 // check each field of the cached firewall and the DO API firewall and update any discrepancies until it
 // matches the target state (cached firewall).
-func (c *Controller) reconcileFirewall(ctx context.Context, targetState godo.Firewall, currentState godo.Firewall) error {
+func (fm *FirewallManagerOp) reconcileFirewall(ctx context.Context, targetState godo.Firewall, currentState godo.Firewall, fc *FirewallController) error {
 	updateStateRequest := &godo.FirewallRequest{}
 	if targetState.Name != currentState.Name {
 		updateStateRequest.Name = targetState.Name
@@ -293,13 +293,29 @@ func (c *Controller) reconcileFirewall(ctx context.Context, targetState godo.Fir
 	if !cmp.Equal(targetState.Tags, currentState.Tags) {
 		updateStateRequest.Tags = targetState.Tags
 	}
-	_, resp, err := c.firewallService.Update(ctx, targetState.ID, updateStateRequest)
+	fwsvc := fm.client.Firewalls
+	_, resp, err := fwsvc.Update(ctx, targetState.ID, updateStateRequest)
 	if err != nil {
 		return fmt.Errorf("failed to update firewall state: %s", err)
 	}
 	if resp.StatusCode == 404 {
-		c.createFirewallAndUpdateCache(ctx, targetState.InboundRules)
+		fm.createFirewallAndUpdateCache(ctx, targetState.InboundRules, fc)
 		return nil
 	}
 	return nil
+}
+
+func (fm *FirewallManagerOp) createFirewallAndUpdateCache(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
+	// make create request since firewall does not exist, then cache firewall state.
+	fr := &godo.FirewallRequest{
+		Name:         fc.workerFirewallName,
+		InboundRules: inboundRules,
+	}
+	fwsvc := fm.client.Firewalls
+	fw, _, err := fwsvc.Create(ctx, fr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create firewall: %s", err)
+	}
+	fm.updateCache(fw)
+	return fw, nil
 }

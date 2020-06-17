@@ -143,6 +143,7 @@ func init() {
 
 func (c *cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
 	clientset := clientBuilder.ClientOrDie("do-shared-informers")
+	ctx := context.TODO()
 	sharedInformer := informers.NewSharedInformerFactory(clientset, 0)
 
 	res := NewResourcesController(c.resources, sharedInformer.Core().V1().Services(), clientset)
@@ -151,12 +152,13 @@ func (c *cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, 
 	sharedInformer.WaitForCacheSync(nil)
 
 	if c.resources.firewallName != "" {
-		firewallService := c.client.Firewalls
-		fw, err := NewFirewallController(c.resources.firewallName, c.resources.kclient, &firewallService, sharedInformer.Core().V1().Services())
+		fwsvc := &c.client.Firewalls
+		fw, err := NewFirewallController(c.resources.firewallName, c.resources.kclient, &godo.Client{}, fwsvc, sharedInformer.Core().V1().Services(), []string{}, ctx)
 		if err != nil {
 			klog.Errorf("Failed to initialize firewall controller: %s", err)
 		}
-		go fw.Run(stop)
+		inboundRules := []godo.InboundRule{}
+		go fw.Run(ctx, inboundRules, stop)
 	}
 	go res.Run(stop)
 	go c.serveDebug(stop)
