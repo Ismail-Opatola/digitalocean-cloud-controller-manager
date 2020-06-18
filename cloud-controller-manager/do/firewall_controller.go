@@ -18,6 +18,7 @@ package do
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -140,7 +141,7 @@ func (fc *FirewallController) Run(ctx context.Context, inboundRules []godo.Inbou
 		}
 		cache := fm.fwCache
 		if cache == nil {
-			fc.updateCache(targetFirewallState, &firewallManagerOp{})
+			fc.updateCache(&targetFirewallState, &firewallManagerOp{})
 		}
 		if currentFirewallState != nil {
 			if cmp.Equal(currentFirewallState, targetFirewallState) {
@@ -155,33 +156,34 @@ func (fc *FirewallController) Run(ctx context.Context, inboundRules []godo.Inbou
 }
 
 // Get returns the current CCM worker firewall representation.
-func (fm *firewallManagerOp) Get(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
+func (fm *firewallManagerOp) Get(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (godo.Firewall, error) {
 	// return the firewall stored in the cache.
 	if fm.firewallCacheExists() {
 		fwsvc := fm.client.Firewalls
 		fw, _, err := fwsvc.Get(ctx, fm.fwCache.firewall.state.ID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get firewall: %s", err)
+		if err == nil && fw != nil {
+			return *fw, nil
 		}
-		return fw, nil
 	}
 	// cached firewall does not exist, so iterate through firewall API provided list and return
 	// the firewall with the matching firewall name.
 	firewallList, err := allFirewallList(ctx, fm.client)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list firewalls: %s", err)
-	}
-	for _, fw := range firewallList {
-		if fw.Name == fc.workerFirewallName {
-			return &fw, nil
+	if err == nil && firewallList != nil {
+		for _, fw := range firewallList {
+			if fw.Name == fc.workerFirewallName {
+				return fw, nil
+			}
 		}
 	}
 	// firewall is not found via firewalls API, so we need to create it.
 	fw, err := fm.createFirewallAndUpdateCache(ctx, inboundRules, fc)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create firewall: %s", err)
+		return godo.Firewall{}, fmt.Errorf("failed to create firewall: %s", err)
+	} else if fw == nil {
+		err = errors.New("DO API firewall creation unexpectedly failed")
+		return godo.Firewall{}, fmt.Errorf("failed to create firewall: %s", err)
 	}
-	return fw, nil
+	return *fw, nil
 }
 
 // Set applies the given inbound rules to the CCM worker firewall when the current rules and target rules differ.
@@ -193,7 +195,7 @@ func (fm *firewallManagerOp) Set(ctx context.Context, inboundRules []godo.Inboun
 	if err != nil {
 		return fmt.Errorf("failed to get firewall state: %s", err)
 	}
-	err = fm.checkFirewallEquality(ctx, fw, inboundRules, fc)
+	err = fm.checkFirewallEquality(ctx, &fw, inboundRules, fc)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile current firewall state with target firewall state: %v", err)
 	}
@@ -325,9 +327,12 @@ func (fm *firewallManagerOp) createFirewallAndUpdateCache(ctx context.Context, i
 		InboundRules: inboundRules,
 	}
 	fwsvc := fm.client.Firewalls
-	fw, _, err := fwsvc.Create(ctx, fr)
+	fw, resp, err := fwsvc.Create(ctx, fr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create firewall: %s", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("Some value: %v", resp.StatusCode)
 	}
 	fc.updateCache(fw, fm)
 	return fw, nil

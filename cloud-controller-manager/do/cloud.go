@@ -155,7 +155,7 @@ func (c *cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, 
 	go c.serveDebug(stop)
 	// if c.resources.firewallName != "" {
 	// 	fwManagerOp := FirewallManagerOp{
-	// 		client:  &godo.Client{},
+	// 		client:  c.client,
 	// 		fwCache: &FirewallCache{},
 	// 	}
 	// 	fc, err := NewFirewallController(c.resources.firewallName, c.resources.kclient, sharedInformer.Core().V1().Services(), []string{}, fwManagerOp, ctx)
