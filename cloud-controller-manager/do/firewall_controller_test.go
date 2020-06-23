@@ -338,24 +338,27 @@ func TestFirewallController_Set(t *testing.T) {
 // 		w.Write([]byte(`{"account":null}`))
 // 	}))
 // 	gclient, _ := godo.New(http.DefaultClient, godo.SetBaseURL(ts.URL))
-// 	var fwManager FirewallManager
-// 	fwManager = FirewallManager{
-// 		client:  gclient,
-// 		fwCache: &firewallCache{},
+// 	inboundRule := godo.InboundRule{
+// 		Protocol:  "tcp",
+// 		PortRange: "31000",
+// 		Sources: &godo.Sources{
+// 			Tags:       []string{"my-tag1"},
+// 			DropletIDs: []int{1},
+// 		},
 // 	}
-// 	rule := &godo.InboundRule{}
-// 	inboundRules := []godo.InboundRule{*rule}
-// 	fc, err := NewFirewallController(fakeWorkerFirewallName, kclient, gclient, inf.Core().V1().Services(), []string{}, &fwManager, ctx)
+// 	inboundRules := []godo.InboundRule{inboundRule}
+// 	fc, err := NewFirewallController(fakeWorkerFirewallName, kclient, gclient, inf.Core().V1().Services(), []string{}, ctx)
 // 	stop := make(chan struct{})
 
 // 	// run actual tests
-// 	fwManagerOp := newFakeFirewallManagerOp()
+// 	fwCache := newFakeFirewallCache(fakeWorkerFirewallName, inboundRule)
+// 	fwManagerOp := newFakeFirewallManagerOp(gclient, fwCache)
 // 	go fc.Run(ctx, inboundRules, &godo.Firewall{}, fwManagerOp, stop)
 // 	select {
 // 	case <-stop:
 // 		// No-op: test succeeded
-// 		assert.NoError(t, err)
-// 		assert.NotNil(t, fc)
+// 		assert.NilError(t, err)
+// 		// assert.NotNil(t, fc)
 // 	case <-time.After(3 * time.Second):
 // 		// Terminate goroutines just in case.
 // 		close(stop)
