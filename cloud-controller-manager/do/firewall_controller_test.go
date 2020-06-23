@@ -19,9 +19,12 @@ package do
 import (
 	"context"
 	"errors"
+	// "fmt"
+
 	"testing"
 
 	"github.com/digitalocean/godo"
+	"gotest.tools/assert"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -64,6 +67,18 @@ func newFakeFirewallManagerOp(client *godo.Client, cache *firewallCache) *firewa
 	return &firewallManagerOp{
 		client:  client,
 		fwCache: cache,
+	}
+}
+
+func newFakeFirewallCache(workerFirewallName string, inboundRule godo.InboundRule) *firewallCache {
+	return &firewallCache{
+		firewall: &cachedFirewall{
+			state: &godo.Firewall{
+				ID:           "123",
+				Name:         workerFirewallName,
+				InboundRules: []godo.InboundRule{inboundRule},
+			},
+		},
 	}
 }
 
@@ -143,10 +158,10 @@ func (f *fakeFirewallService) RemoveRules(ctx context.Context, fID string, rr *g
 	return f.removeRulesFunc(ctx, fID, rr)
 }
 
-func newFakeFirewall(name string, inboundRule godo.InboundRule) *godo.Firewall {
+func newFakeFirewall(workerFirewallName string, inboundRule godo.InboundRule) *godo.Firewall {
 	return &godo.Firewall{
 		ID:           "123",
-		Name:         "test-firewall",
+		Name:         workerFirewallName,
 		InboundRules: []godo.InboundRule{inboundRule},
 	}
 }
@@ -176,34 +191,34 @@ func TestFirewallController_Get(t *testing.T) {
 		expectedError error
 	}{
 		{
-			name:          "fails to get worker firewall from cache",
+			name:          "retrieve from DO firewall API and update local cache",
 			firewall:      newFakeFirewall(workerFirewallName, inboundRule),
-			fwCache:       nil,
+			fwCache:       newFakeFirewallCache(workerFirewallName, inboundRule),
 			godoResponse:  newFakeOKResponse(),
 			expectedError: nil,
 		},
 		{
-			name:          "fails to get worker firewall from DO firewall API",
+			name:          "fails to get worker firewall from DO firewall API and returns error",
 			firewall:      newFakeFirewall(workerFirewallName, inboundRule),
 			fwCache:       nil,
 			godoResponse:  newFakeNotOKResponse(),
 			expectedError: errors.New("failed to retrieve firewall from DO firewall API:"),
 		},
-		{
-			name:     "gets worker firewall from cache",
-			firewall: newFakeFirewall(workerFirewallName, inboundRule),
-			fwCache: &firewallCache{
-				firewall: &cachedFirewall{
-					state: &godo.Firewall{
-						ID:           "123",
-						Name:         "test-worker-firewall",
-						InboundRules: []godo.InboundRule{inboundRule},
-					},
-				},
-			},
-			godoResponse:  nil,
-			expectedError: nil,
-		},
+		// {
+		// 	name:     "gets worker firewall from cache",
+		// 	firewall: newFakeFirewall(workerFirewallName, inboundRule),
+		// 	fwCache: &firewallCache{
+		// 		firewall: &cachedFirewall{
+		// 			state: &godo.Firewall{
+		// 				ID:           "123",
+		// 				Name:         "test-worker-firewall",
+		// 				InboundRules: []godo.InboundRule{inboundRule},
+		// 			},
+		// 		},
+		// 	},
+		// 	godoResponse:  nil,
+		// 	expectedError: errors.New("failed to retrieve firewall from DO firewall API"),
+		// },
 	}
 
 	for _, test := range testcases {
@@ -218,14 +233,23 @@ func TestFirewallController_Get(t *testing.T) {
 					},
 				},
 			)
-			// fwManagerOp := newFakeFirewallManagerOp(gclient, cache *firewallCache)
-			// fwManager := newFakeFirewallManager(*test.firewall)
-			// fakeFwManager = fwManager
 			fc, _ := NewFirewallController(workerFirewallName, kclient, gclient, inf.Core().V1().Services(), []string{}, ctx)
-			// fwManager.Get(ctx, []godo.InboundRule{inboundRule})
 
 			fwManagerOp := newFakeFirewallManagerOp(fc.client, &firewallCache{})
-			fwManagerOp.Get(ctx, []godo.InboundRule{inboundRule}, fc)
+			fw, err := fwManagerOp.Get(ctx, []godo.InboundRule{inboundRule}, fc)
+			if test.expectedError != nil {
+				assert.ErrorContains(t, err, test.expectedError.Error())
+			} else {
+				// simple Equal checks on strings
+				assert.Equal(t, fw.ID, test.firewall.ID)
+				assert.Equal(t, fw.Name, test.firewall.Name)
+				assert.Equal(t, fw.Status, test.firewall.Status)
+				// DeepEqual check needed for slices
+				assert.DeepEqual(t, fw.InboundRules, test.firewall.InboundRules)
+				assert.DeepEqual(t, fw.DropletIDs, test.firewall.DropletIDs)
+				// check that the Firewall Controller firewall name is what is expected
+				assert.Equal(t, fc.workerFirewallName, test.firewall.Name)
+			}
 		})
 	}
 }

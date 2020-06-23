@@ -251,7 +251,11 @@ func (fc *FirewallController) updateCache(firewall *godo.Firewall, fm *firewallM
 	fm.fwCache.mu.Lock()
 	defer fm.fwCache.mu.Unlock()
 	if firewall != nil {
-		fm.fwCache.firewall.state = firewall
+		fm.fwCache = &firewallCache{
+			firewall: &cachedFirewall{
+				state: firewall,
+			},
+		}
 	}
 }
 

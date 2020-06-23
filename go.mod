@@ -17,6 +17,7 @@ require (
 	golang.org/x/lint v0.0.0-20190409202823-959b441ac422
 	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
 	gopkg.in/ini.v1 v1.42.0 // indirect
+	gotest.tools v2.2.0+incompatible
 	k8s.io/api v0.18.3
 	k8s.io/apimachinery v0.18.3
 	k8s.io/apiserver v0.18.3
