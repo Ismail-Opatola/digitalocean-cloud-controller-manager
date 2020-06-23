@@ -19,115 +19,52 @@ package do
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"path"
-	"sync"
 	"testing"
 
 	"github.com/digitalocean/godo"
-	"github.com/stretchr/testify/assert"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-type stubCachedFirewall struct {
-	state *godo.Firewall
-}
+var (
+	ctx = context.TODO()
 
-type stubFirewallCache struct {
-	mu       sync.RWMutex
-	firewall *stubCachedFirewall
-}
+	kclient = fake.NewSimpleClientset()
 
-type stubFirewallManagerOp struct {
-	client  *godo.Client
-	fwCache *stubFirewallCache
+	inf = informers.NewSharedInformerFactory(kclient, 0)
+)
+
+type fakeFirewallManager struct {
+	getFunc func(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) (godo.Firewall, error)
+	setFunc func(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) error
 }
 
 // Get returns the current CCM worker firewall representation.
-func (fm *stubFirewallManagerOp) Get(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (godo.Firewall, error) {
-	// return the firewall stored in the cache.
-	if fm.firewallCacheExists() {
-		fwsvc := fm.client.Firewalls
-		fw, _, err := fwsvc.Get(ctx, fm.fwCache.firewall.state.ID)
-		if err == nil && fw != nil {
-			return *fw, nil
-		}
-	}
-	// cached firewall does not exist, so iterate through firewall API provided list and return
-	// the firewall with the matching firewall name.
-	firewallList, err := allFirewallList(ctx, fm.client)
-	if err == nil && firewallList != nil {
-		for _, fw := range firewallList {
-			if fw.Name == fc.workerFirewallName {
-				return fw, nil
-			}
-		}
-	}
-	// firewall is not found via firewalls API, so we need to create it.
-	fw, err := fm.createFirewallAndUpdateCache(ctx, inboundRules, fc)
-	if err != nil {
-		return godo.Firewall{}, fmt.Errorf("failed to create firewall: %s", err)
-	} else if fw == nil {
-		err = errors.New("DO API firewall creation unexpectedly failed")
-		return godo.Firewall{}, fmt.Errorf("failed to create firewall: %s", err)
-	}
-	return *fw, nil
+func (f *fakeFirewallManager) Get(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) (godo.Firewall, error) {
+	return f.getFunc(ctx, inboundRules, c)
 }
 
 // Set applies the given inbound rules to the CCM worker firewall when the current rules and target rules differ.
-func (fm *stubFirewallManagerOp) Set(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) error {
-	// retrieve the target firewall representation (CCM worker firewall from cache) and the
-	// current firewall representation from the DO firewalls API. If there are any differences,
-	// handle it.
-	fw, err := fm.Get(ctx, inboundRules, c)
-	if err != nil {
-		return fmt.Errorf("failed to get firewall state: %s", err)
-	}
-	err = fm.checkFirewallEquality(ctx, &fw, inboundRules, c)
-	if err != nil {
-		return fmt.Errorf("failed to reconcile current firewall state with target firewall state: %v", err)
-	}
-
-	return nil
+func (f *fakeFirewallManager) Set(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) error {
+	return f.setFunc(ctx, inboundRules, c)
 }
 
-func (fm *stubFirewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo.Firewall, inboundRules []godo.InboundRule, fc *FirewallController) error {
-	return nil
-}
+// func newFakeFirewallManager(firewall godo.Firewall) *FirewallManager {
+// 	return &FirewallManager{
+// 		getFunc: func(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) (godo.Firewall, error) {
+// 			return firewall, nil
+// 		},
+// 		setFunc: func(ctx context.Context, inboundRules []godo.InboundRule, c *FirewallController) error {
+// 			return nil
+// 		},
+// 	}
+// }
 
-func (fm *stubFirewallManagerOp) createFirewallAndUpdateCache(ctx context.Context, inboundRules []godo.InboundRule, fc *FirewallController) (*godo.Firewall, error) {
-	// make create request since firewall does not exist, then cache firewall state.
-	fr := &godo.FirewallRequest{
-		Name:         fc.workerFirewallName,
-		InboundRules: inboundRules,
+func newFakeFirewallManagerOp(client *godo.Client, cache *firewallCache) *firewallManagerOp {
+	return &firewallManagerOp{
+		client:  client,
+		fwCache: cache,
 	}
-	fwsvc := fm.client.Firewalls
-	fw, _, err := fwsvc.Create(ctx, fr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create firewall: %s", err)
-	}
-	fm.updateCache(fw)
-	return fw, nil
-}
-
-func (fm *stubFirewallManagerOp) updateCache(firewall *godo.Firewall) {
-	fm.fwCache.mu.Lock()
-	defer fm.fwCache.mu.Unlock()
-	if firewall != nil {
-		fm.fwCache.firewall.state = firewall
-	}
-}
-
-func (fm *stubFirewallManagerOp) firewallCacheExists() bool {
-	fm.fwCache.mu.RLock()
-	defer fm.fwCache.mu.RUnlock()
-	if fm.fwCache.firewall != nil {
-		return true
-	}
-	return false
 }
 
 // fakeFirewallService concrete type that satisfies the FirewallsService interface.
@@ -197,38 +134,14 @@ func (f *fakeFirewallService) RemoveTags(ctx context.Context, fID string, tags .
 }
 
 // AddRules to a Firewall.
-func (f *fakeFirewallService) AddRules(ctx context.Context, fID string, rr *FirewallRulesRequest) (*godo.Response, error) {
+func (f *fakeFirewallService) AddRules(ctx context.Context, fID string, rr *godo.FirewallRulesRequest) (*godo.Response, error) {
 	return f.addRulesFunc(ctx, fID, rr)
 }
 
 // RemoveRules from a Firewall.
-func (f *fakeFirewallService) RemoveRules(ctx context.Context, fID string, rr *FirewallRulesRequest) (*godo.Response, error) {
+func (f *fakeFirewallService) RemoveRules(ctx context.Context, fID string, rr *godo.FirewallRulesRequest) (*godo.Response, error) {
 	return f.removeRulesFunc(ctx, fID, rr)
 }
-
-// func newFakeFirewallNoInboundRules() *godo.Firewall {
-// 	return &godo.Firewall{
-// 		ID:   "123",
-// 		Name: "test-firewall",
-// 	}
-// }
-
-// func newFakeFirewallWithInboundRules() *godo.Firewall {
-// 	return &godo.Firewall{
-// 		ID:   "123",
-// 		Name: "test-firewall",
-// 		InboundRules: []godo.InboundRule{
-// 			godo.InboundRule{
-// 				Protocol:  "tcp",
-// 				PortRange: "31200",
-// 				Sources: &godo.Sources{
-// 					Tags:       []string{"my-tag1", "my-tag2"},
-// 					DropletIDs: []int{1, 2, 3},
-// 				},
-// 			},
-// 		},
-// 	}
-// }
 
 func newFakeFirewall(name string, inboundRule godo.InboundRule) *godo.Firewall {
 	return &godo.Firewall{
@@ -238,21 +151,184 @@ func newFakeFirewall(name string, inboundRule godo.InboundRule) *godo.Firewall {
 	}
 }
 
+func newFakeGodoClient(fakeFirewall *fakeFirewallService) *godo.Client {
+	return &godo.Client{
+		Firewalls: fakeFirewall,
+	}
+}
+
+func TestFirewallController_Get(t *testing.T) {
+	workerFirewallName := "test-worker-firewall"
+	inboundRule := godo.InboundRule{
+		Protocol:  "tcp",
+		PortRange: "31000",
+		Sources: &godo.Sources{
+			Tags:       []string{"my-tag1"},
+			DropletIDs: []int{1},
+		},
+	}
+
+	testcases := []struct {
+		name          string
+		firewall      *godo.Firewall
+		fwCache       *firewallCache
+		godoResponse  *godo.Response
+		expectedError error
+	}{
+		{
+			name:          "fails to get worker firewall from cache",
+			firewall:      newFakeFirewall(workerFirewallName, inboundRule),
+			fwCache:       nil,
+			godoResponse:  newFakeOKResponse(),
+			expectedError: nil,
+		},
+		{
+			name:          "fails to get worker firewall from DO firewall API",
+			firewall:      newFakeFirewall(workerFirewallName, inboundRule),
+			fwCache:       nil,
+			godoResponse:  newFakeNotOKResponse(),
+			expectedError: errors.New("failed to retrieve firewall from DO firewall API:"),
+		},
+		{
+			name:     "gets worker firewall from cache",
+			firewall: newFakeFirewall(workerFirewallName, inboundRule),
+			fwCache: &firewallCache{
+				firewall: &cachedFirewall{
+					state: &godo.Firewall{
+						ID:           "123",
+						Name:         "test-worker-firewall",
+						InboundRules: []godo.InboundRule{inboundRule},
+					},
+				},
+			},
+			godoResponse:  nil,
+			expectedError: nil,
+		},
+	}
+
+	for _, test := range testcases {
+		t.Run(test.name, func(t *testing.T) {
+			gclient := newFakeGodoClient(
+				&fakeFirewallService{
+					getFunc: func(context.Context, string) (*godo.Firewall, *godo.Response, error) {
+						return test.firewall, test.godoResponse, test.expectedError
+					},
+					listFunc: func(context.Context, *godo.ListOptions) ([]godo.Firewall, *godo.Response, error) {
+						return []godo.Firewall{*test.firewall}, test.godoResponse, test.expectedError
+					},
+				},
+			)
+			// fwManagerOp := newFakeFirewallManagerOp(gclient, cache *firewallCache)
+			// fwManager := newFakeFirewallManager(*test.firewall)
+			// fakeFwManager = fwManager
+			fc, _ := NewFirewallController(workerFirewallName, kclient, gclient, inf.Core().V1().Services(), []string{}, ctx)
+			// fwManager.Get(ctx, []godo.InboundRule{inboundRule})
+
+			fwManagerOp := newFakeFirewallManagerOp(fc.client, &firewallCache{})
+			fwManagerOp.Get(ctx, []godo.InboundRule{inboundRule}, fc)
+		})
+	}
+}
+
+// func TestFirewallController_Get(t *testing.T) {
+// 	testcases := []struct {
+// 		name               string
+// 		workerFirewallName string
+// 		inboundRule        godo.InboundRule
+// 		fwCache            *firewallCache
+// 		godoResponse       *godo.Response
+// 		expectedError      error
+// 	}{
+// 		{
+// 			name:               "fails to get worker firewall from cache",
+// 			workerFirewallName: "test-worker-firewall",
+// 			inboundRule: &godo.InboundRule{
+// 				Protocol:  "tcp",
+// 				PortRange: "31000",
+// 				Sources: &godo.Sources{
+// 					Tags:       []string{"my-tag1"},
+// 					DropletIDs: []int{1},
+// 				},
+// 			},
+// 			fwCache:       nil,
+// 			godoResponse:  newFakeOKResponse(),
+// 			expectedError: nil,
+// 		},
+// 		{
+// 			name:               "fails to get worker firewall from DO firewall API",
+// 			workerFirewallName: "test-worker-firewall",
+// 			inboundRule: &godo.InboundRule{
+// 				Protocol:  "tcp",
+// 				PortRange: "31000",
+// 				Sources: &godo.Sources{
+// 					Tags:       []string{"my-tag1"},
+// 					DropletIDs: []int{1},
+// 				},
+// 			},
+// 			fwCache:       nil,
+// 			godoResponse:  newFakeNotOkResponse(),
+// 			expectedError: errors.New("failed to retrieve firewall from DO firewall API:"),
+// 		},
+// 		{
+// 			name:               "gets worker firewall from cache",
+// 			workerFirewallName: "test-worker-firewall",
+// 			inboundRule: &godo.InboundRule{
+// 				Protocol:  "tcp",
+// 				PortRange: "31000",
+// 				Sources: &godo.Sources{
+// 					Tags:       []string{"my-tag1"},
+// 					DropletIDs: []int{1},
+// 				},
+// 			},
+// 			fwCache: &firewallCache{
+// 				firewall: &cachedFirewall{
+// 					state: &godo.Firewall{
+// 						ID:   "123",
+// 						Name: "test-worker-firewall",
+// 						InboundRules: []godo.InboundRule{
+// 							&godo.InboundRule{
+// 								Protocol:  "tcp",
+// 								PortRange: "31000",
+// 								Sources: &godo.Sources{
+// 									Tags:       []string{"my-tag1"},
+// 									DropletIDs: []int{1},
+// 								},
+// 							},
+// 						},
+// 					},
+// 				},
+// 			},
+// 			godoResponse:  nil,
+// 			expectedError: nil,
+// 		},
+// 	}
+
+// 	for _, test := range testcases {
+// 		gclient := newFakeClient{
+// 			&fakeFirewallService{
+// 				getFunc: func(context.Context, string) (*godo.Firewall, *godo.Response, error) {
+// 					return newFakeFirewall(test.workerFirewallName, test.inboundRule), test.godoResponse, test.expectedError
+// 				},
+// 				listFunc: func(context.Context, *godo.ListOptions) ([]godo.Firewall, *godo.Response, error) {
+// 					return newFakeFirewall(test.workerFirewallName, test.inboundRule), test.godoResponse, test.expectedError
+// 				},
+// 			},
+// 		},
+// 	},
+// }
+
 // func TestFirewallController_Run(t *testing.T) {
 // 	// setup arguments
-// 	ctx := context.TODO()
 // 	fakeWorkerFirewallName := "myFirewallWorkerName"
-// 	kclient := fake.NewSimpleClientset()
-// 	inf := informers.NewSharedInformerFactory(kclient, 0)
 // 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 // 		w.WriteHeader(http.StatusOK)
 // 		w.Write([]byte(`{"account":null}`))
 // 	}))
 // 	gclient, _ := godo.New(http.DefaultClient, godo.SetBaseURL(ts.URL))
 // 	var fwManager FirewallManager
-// 	fwManager = &stubFirewallManagerOp{
+// 	fwManager = FirewallManager{
 // 		client:  gclient,
-// 		fwCache: &stubFirewallCache{},
+// 		fwCache: &firewallCache{},
 // 	}
 // 	rule := &godo.InboundRule{}
 // 	inboundRules := []godo.InboundRule{*rule}
@@ -260,11 +336,7 @@ func newFakeFirewall(name string, inboundRule godo.InboundRule) *godo.Firewall {
 // 	stop := make(chan struct{})
 
 // 	// run actual tests
-// 	var fwManagerOp *firewallManagerOp
-// 	fwManagerOp = &firewallManagerOp{
-// 		client:  gclient,
-// 		fwCache: &firewallCache{},
-// 	}
+// 	fwManagerOp := newFakeFirewallManagerOp()
 // 	go fc.Run(ctx, inboundRules, &godo.Firewall{}, fwManagerOp, stop)
 // 	select {
 // 	case <-stop:
@@ -277,61 +349,49 @@ func newFakeFirewall(name string, inboundRule godo.InboundRule) *godo.Firewall {
 // 	}
 // }
 
-var (
-	mux *http.ServeMux
+// func TestFirewallController_Get(t *testing.T) {
+// 	// setup arguments
+// 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+// 		w.WriteHeader(http.StatusOK)
+// 		w.Write([]byte(`{"account":null}`))
+// 	}))
+// 	gclient, _ := godo.New(http.DefaultClient, godo.SetBaseURL(ts.URL))
 
-	ctx = context.TODO()
+// sources := &godo.Sources{
+// 	Tags:       []string{"my-tag1", "my-tag2"},
+// 	DropletIDs: []int{1, 2, 3},
+// }
+// 	// setup firewall manager
+// 	rule := &godo.InboundRule{
+// 		Protocol:  "tcp",
+// 		PortRange: "31000",
+// 		Sources:   sources,
+// 	}
+// 	inboundRules := []godo.InboundRule{*rule}
+// 	expectedFirewall := &godo.Firewall{
+// 		ID:           "123",
+// 		Name:         fakeWorkerFirewallName,
+// 		InboundRules: inboundRules,
+// 	}
+// 	cachedFw := &stubCachedFirewall{state: expectedFirewall}
+// 	var fwManager FirewallManager
+// 	fwManager = &stubFirewallManagerOp{
+// 		client:  gclient,
+// 		fwCache: &stubFirewallCache{firewall: cachedFw},
+// 	}
+// 	fc, err := NewFirewallController(fakeWorkerFirewallName, kclient, gclient, inf.Core().V1().Services(), []string{}, &fwManager, ctx)
+// 	// handle godo http requests
+// 	urlStr := "/v2/firewalls"
+// 	fID := "fe6b88f2-b42b-4bf7-bbd3-5ae20208f0b0"
+// 	urlStr = path.Join(urlStr, fID)
 
-	fakeWorkerFirewallName = "myFirewallWorkerName"
+// 	mux.HandleFunc(urlStr, func(w http.ResponseWriter, r *http.Request) {
+// 		testMethod(t, r, http.MethodGet)
+// 		fmt.Fprint(w, firewallJSONResponse)
+// 	})
 
-	kclient = fake.NewSimpleClientset()
-
-	inf = informers.NewSharedInformerFactory(kclient, 0)
-)
-
-func TestFirewallController_Get(t *testing.T) {
-	// setup arguments
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"account":null}`))
-	}))
-	gclient, _ := godo.New(http.DefaultClient, godo.SetBaseURL(ts.URL))
-
-	sources := &godo.Sources{
-		Tags:       []string{"my-tag1", "my-tag2"},
-		DropletIDs: []int{1, 2, 3},
-	}
-	// setup firewall manager
-	rule := &godo.InboundRule{
-		Protocol:  "tcp",
-		PortRange: "31000",
-		Sources:   sources,
-	}
-	inboundRules := []godo.InboundRule{*rule}
-	expectedFirewall := &godo.Firewall{
-		ID:           "123",
-		Name:         fakeWorkerFirewallName,
-		InboundRules: inboundRules,
-	}
-	cachedFw := &stubCachedFirewall{state: expectedFirewall}
-	var fwManager FirewallManager
-	fwManager = &stubFirewallManagerOp{
-		client:  gclient,
-		fwCache: &stubFirewallCache{firewall: cachedFw},
-	}
-	fc, err := NewFirewallController(fakeWorkerFirewallName, kclient, gclient, inf.Core().V1().Services(), []string{}, &fwManager, ctx)
-	// handle godo http requests
-	urlStr := "/v2/firewalls"
-	fID := "fe6b88f2-b42b-4bf7-bbd3-5ae20208f0b0"
-	urlStr = path.Join(urlStr, fID)
-
-	mux.HandleFunc(urlStr, func(w http.ResponseWriter, r *http.Request) {
-		testMethod(t, r, http.MethodGet)
-		fmt.Fprint(w, firewallJSONResponse)
-	})
-
-	// run actual tests
-	actualFirewall, err := fwManager.Get(ctx, inboundRules, fc)
-	assert.NoError(t, err)
-	assert.Equal(t, expectedFirewall, actualFirewall)
-}
+// 	// run actual tests
+// 	actualFirewall, err := fwManager.Get(ctx, inboundRules, fc)
+// 	assert.NoError(t, err)
+// 	assert.Equal(t, expectedFirewall, actualFirewall)
+// }
