@@ -195,35 +195,25 @@ func (fm *firewallManagerOp) Set(ctx context.Context, inboundRules []godo.Inboun
 }
 
 func (fm *firewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo.Firewall, inboundRules []godo.InboundRule, fc *FirewallController) error {
-	fm.fwCache.mu.RLock()
-	defer fm.fwCache.mu.RUnlock()
-
 	cachedFw := fm.fwCache.firewall.state
-	isEqual := cmp.Equal(cachedFw, fw)
-	if cmp.Equal(cachedFw.InboundRules, inboundRules) && cmp.Equal(fw.InboundRules, inboundRules) {
-		if isEqual {
+
+	if cmp.Equal(cachedFw, fw) && cmp.Equal(cachedFw.InboundRules, inboundRules) {
+		return nil
+	} else if !cmp.Equal(fw.InboundRules, inboundRules) {
+		return fmt.Errorf("firewalls are not equal")
+	} else {
+		fc.updateCache(fw, fm)
+		if cmp.Equal(cachedFw, fw) {
 			return nil
 		}
-	} else if !cmp.Equal(cachedFw.InboundRules, inboundRules) && cmp.Equal(fw.InboundRules, inboundRules) {
-		fc.updateCache(fw, fm)
-	} else if !cmp.Equal(fw.InboundRules, inboundRules) {
-		err := fm.updateFirewallRules(ctx, inboundRules, fc)
-		if err != nil {
-			return fmt.Errorf("failed to update firewall state: %s", err)
-		}
 	}
-	if !isEqual {
-		err := fm.reconcileFirewall(ctx, *cachedFw, *fw, fc)
-		if err != nil {
-			return fmt.Errorf("failed to reconcile firewall state: %s", err)
-		}
-	}
-	return nil
+	return fmt.Errorf("firewalls are not equal")
 }
 
 func (fc *FirewallController) onServiceChange(ctx context.Context, fm *firewallManagerOp) error {
 	var nodePortInboundRules []godo.InboundRule
 	serviceList, err := fc.serviceLister.List(labels.Nothing())
+
 	if err != nil {
 		return fmt.Errorf("failed to get service state: %s", err)
 	}
@@ -250,6 +240,7 @@ func (fc *FirewallController) onServiceChange(ctx context.Context, fm *firewallM
 func (fc *FirewallController) updateCache(firewall *godo.Firewall, fm *firewallManagerOp) {
 	fm.fwCache.mu.Lock()
 	defer fm.fwCache.mu.Unlock()
+
 	if firewall != nil {
 		fm.fwCache = &firewallCache{
 			firewall: &cachedFirewall{
@@ -315,6 +306,7 @@ func (fm *firewallManagerOp) createFirewallAndUpdateCache(ctx context.Context, i
 	}
 	fwsvc := fm.client.Firewalls
 	fw, resp, err := fwsvc.Create(ctx, fr)
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to create firewall: %s", err)
 	}
