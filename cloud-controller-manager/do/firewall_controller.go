@@ -188,7 +188,10 @@ func (fm *firewallManagerOp) Set(ctx context.Context, inboundRules []godo.Inboun
 	}
 	err = fm.checkFirewallEquality(ctx, &fw, inboundRules, fc)
 	if err != nil {
-		return fmt.Errorf("failed to reconcile current firewall state with target firewall state: %v", err)
+		err = fm.reconcileFirewall(ctx, *fm.fwCache.firewall.state, fw, fc)
+		if err != nil {
+			return fmt.Errorf("failed to reconcile current firewall state with target firewall state")
+		}
 	}
 
 	return nil
@@ -200,22 +203,37 @@ func (fm *firewallManagerOp) checkFirewallEquality(ctx context.Context, fw *godo
 	if cmp.Equal(cachedFw, fw) && cmp.Equal(cachedFw.InboundRules, inboundRules) {
 		return nil
 	} else if !cmp.Equal(fw.InboundRules, inboundRules) {
-		return fmt.Errorf("firewalls are not equal")
-	} else {
-		fc.updateCache(fw, fm)
-		if cmp.Equal(cachedFw, fw) {
-			return nil
+		err := fm.updateFirewallRules(ctx, inboundRules, fc)
+		if err != nil {
+			return fmt.Errorf("firewalls are not equal: %v", err)
 		}
+	}
+	fc.updateCache(fw, fm)
+	if cmp.Equal(cachedFw, fw) {
+		return nil
 	}
 	return fmt.Errorf("firewalls are not equal")
 }
 
 func (fc *FirewallController) onServiceChange(ctx context.Context, fm *firewallManagerOp) error {
-	var nodePortInboundRules []godo.InboundRule
 	serviceList, err := fc.serviceLister.List(labels.Nothing())
-
 	if err != nil {
 		return fmt.Errorf("failed to get service state: %s", err)
+	}
+	inboundRules, err := fm.createInboundRules(serviceList, fc)
+	if err != nil {
+		return fmt.Errorf("failed to create inbound rules on service change: %v", err)
+	}
+	if inboundRules != nil {
+		fm.Set(ctx, inboundRules, fc)
+	}
+	return nil
+}
+
+func (fm *firewallManagerOp) createInboundRules(serviceList []*v1.Service, fc *FirewallController) ([]godo.InboundRule, error) {
+	var nodePortInboundRules []godo.InboundRule
+	if serviceList == nil {
+		return nil, fmt.Errorf("failed to retrieve services and their inbound rules")
 	}
 	for _, svc := range serviceList {
 		if svc.Spec.Type == v1.ServiceTypeNodePort {
@@ -230,11 +248,11 @@ func (fc *FirewallController) onServiceChange(ctx context.Context, fm *firewallM
 				})
 			}
 		}
+		if nodePortInboundRules == nil {
+			return nil, fmt.Errorf("could not create node port inbound rules")
+		}
 	}
-	if len(nodePortInboundRules) == 0 {
-		return nil
-	}
-	return fm.Set(ctx, nodePortInboundRules, fc)
+	return nodePortInboundRules, nil
 }
 
 func (fc *FirewallController) updateCache(firewall *godo.Firewall, fm *firewallManagerOp) {
@@ -251,10 +269,10 @@ func (fc *FirewallController) updateCache(firewall *godo.Firewall, fm *firewallM
 }
 
 func (fm *firewallManagerOp) cachedFirewallExists() bool {
-	fm.fwCache.mu.RLock()
-	defer fm.fwCache.mu.RUnlock()
-	if fm.fwCache.firewall != nil {
-		return true
+	if fm.fwCache != nil {
+		if fm.fwCache.firewall != nil {
+			return true
+		}
 	}
 	return false
 }
